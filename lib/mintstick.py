@@ -1,32 +1,24 @@
-#!/usr/bin/python2
+#
+# author => Cihat Altiparmak jarbay910@gmail.com
+# forked from https://github.com/linuxmint/mintstick
 
-import commands
-from subprocess import Popen,PIPE,call,STDOUT
-import os
-import signal
-import re
-import gettext
-import locale
-import sys
-import getopt
-import time
 import gi
-
-gi.require_version('Polkit', '1.0')
-gi.require_version('Gtk', '3.0')
-gi.require_version('UDisks', '2.0')
+gi.require_version("Gtk", '3.0')
+gi.require_version("UDisks", "2.0")
 gi.require_version('XApp', '1.0')
 
-from gi.repository import GObject, Gio, Polkit, Gtk, GLib, UDisks, XApp
+from gi.repository import Gtk, UDisks, Gdk, GLib ,GObject, XApp
 
-try:
-    from gi.repository import Unity
-    Using_Unity = True
-except ImportError:
-    Using_Unity = False
+from threading import Thread, Lock, Event, activeCount
 
-if Using_Unity:
-    launcher = Unity.LauncherEntry.get_for_desktop_id ("mintstick.desktop")
+import time
+import os
+import sys
+import argparse
+import locale
+import gettext
+import signal
+
 
 APP = 'mintstick'
 LOCALE_DIR = "/usr/share/linuxmint/locale"
@@ -35,194 +27,226 @@ gettext.bindtextdomain(APP, LOCALE_DIR)
 gettext.textdomain(APP)
 _ = gettext.gettext
 
-# https://technet.microsoft.com/en-us/library/bb490925.aspx
-FORBIDDEN_CHARS = ["*", "?", "/", "\\", "|", ".", ",", ";", ":", "+", "=", "[", "]", "<", ">", "\""]
+class Dialogs(Gtk.Dialog):
+    def __init__(self, content, parent):
+        Gtk.Dialog.__init__(self, "milisDialog", parent, 0,
+                         (Gtk.STOCK_OK, Gtk.ResponseType.OK))
+        self.set_default_size(200, 100)
+        label = Gtk.Label(content)
+        box = self.get_content_area()
+        box.add(label)
+        self.show_all()
 
-GObject.threads_init()
+class barSignal(GObject.GObject):
+    def __init__(self):
+        GObject.GObject.__init__(self)
 
-def print_timing(func):
-    def wrapper(*arg):
-        t1 = time.time()
-        res = func(*arg)
-        t2 = time.time()
-        print '%s took %0.3f ms' % (func.func_name, (t2-t1)*1000.0)
-        return res
-    return wrapper
+GObject.type_register(barSignal)
+GObject.signal_new("update", barSignal, GObject.SIGNAL_RUN_FIRST,GObject.TYPE_NONE, (float, float, float, ))
 
-class MintStick:
-    def __init__(self, iso_path=None, usb_path=None, filesystem=None, mode=None, debug=False):
+class cancelSignal(GObject.GObject):
+    def __init__(self):
+        GObject.GObject.__init__(self)
 
-        self.debug = debug
+GObject.type_register(cancelSignal)
+GObject.signal_new("cancel", cancelSignal, GObject.SIGNAL_RUN_FIRST,GObject.TYPE_NONE, (bool,))
 
-        def devices_changed_callback(client):
-            self.get_devices()
+class finishSignal(GObject.GObject):
+    def __init__(self):
+        GObject.GObject.__init__(self)
 
-        self.udisks_client = UDisks.Client.new_sync()
-        self.udisk_listener_id = self.udisks_client.connect("changed", devices_changed_callback)
+GObject.type_register(finishSignal)
+GObject.signal_new("finished", finishSignal, GObject.SIGNAL_RUN_FIRST,GObject.TYPE_NONE, (int,))
 
-        # get glade tree
-        self.gladefile = "/usr/share/mintstick/mintstick.ui"
-        self.wTree = Gtk.Builder()
+class writeThread(Thread):
+    def __init__(self, written,
+                       total_size,
+                       size,
+                       targetDeviceHandler,
+                       sourceFileHandler,
+                       updatePosterSignal, 
+                       finishProcessSignal,
+                       cancelProcessSignal, 
+                       window, 
+                       button):
 
-        self.process = None
-        self.source_id = None
+        self.written = written
+        self.total_size = total_size
+        self.size = size
 
-        self.wTree.set_translation_domain(APP)
+        self.targetDeviceHandler = targetDeviceHandler
+        self.sourceFileHandler = sourceFileHandler
 
-        self.wTree.add_from_file(self.gladefile)
+        self.updatePosterSignal = updatePosterSignal
+        self.finishProcessSignal = finishProcessSignal
+        self.cancelProcessSignal = cancelProcessSignal        
+            
+        self.window = window
+        self.button = button
+        self.permission = True
+        self.running = True
+        self.killing = False
 
-        self.ddpid = 0
+        self.lock = Lock()
+        self.cancel_event = Event()
+        self.state_event = Event()
 
-        self.emergency_dialog = self.wTree.get_object("emergency_dialog")
-        self.confirm_dialog =  self.wTree.get_object("confirm_dialog")
-        self.success_dialog = self.wTree.get_object("success_dialog")
+        super(writeThread, self).__init__()
+        self.setDaemon(True) #  when main thread died, this thread must die
 
-        if mode == "iso":
-            self.mode = "normal"
-            self.devicelist = self.wTree.get_object("device_combobox")
-            self.label = self.wTree.get_object("to_label")
-            self.expander = self.wTree.get_object("detail_expander")
-            self.go_button = self.wTree.get_object("write_button")
-            self.go_button.set_label(_("Write"))
-            self.logview = self.wTree.get_object("detail_text")
-            self.progressbar = self.wTree.get_object("progressbar")
-            self.chooser = self.wTree.get_object("filechooserbutton")
+    def run(self):
+        print('[32m'+"[ WriteThread ] -> is started"+'[0m')
+        while not self.cancel_event.isSet():
+            if not self.state_event.isSet():
+                try:
+                    self.write()
+                except:
+                    print("bir hata var")
+                    """
+                    unknownError = Dialogs("Bilinmeyen Bir Hata Meydana Geldi!", self.window)
+                    response = unknownError.run()
+                    if response == Gtk.ResponseType.OK: 
+                        unknownError.hide()
+                    """
+                    self.cancelProcessSignal.emit("cancel", True)
+                    self.cancel_event.set()
+                # finally:
+                    # self.cancelProcessSignal.emit("cancel", 1)
+                    # self.cancel_event.set()
+                    
+        self.updatePosterSignal.emit("update",0.0, 0.0, 0.0)
+        self.button.set_sensitive(True)
+        print('[32m'+"[ WriteThread ] -> is closed"+'[0m')
 
-            # Devicelist model
-            self.devicemodel = Gtk.ListStore(str, str)
+    def write(self):
+        buffer_ = self.sourceFileHandler.read(1096)
+        if len(buffer_) == 0:
+            """process finished"""
+            if self.size == self.total_size:
+                """processs is finished successfully"""
+                self.cancel_event.set()
+                self.isSuccess = 1
+                print("process is finished successfully")
+            else:
+                """processs is failed"""
+                self.cancel_event.set()
+                self.isSuccess = 0
+                print("process is failed")
+            self.finishProcessSignal.emit("finished", self.isSuccess)
+        else:  
+            self.size += len(buffer_)
+            self.written += self.size
+            self.targetDeviceHandler.write(buffer_)          
+            if self.written >= self.total_size/100:
+                self.targetDeviceHandler.flush()
+                self.written = 0
+            self.updatePosterSignal.emit("update",float(self.size/self.total_size), self.size, self.written)
 
-            # Renderer
-            renderer_text = Gtk.CellRendererText()
-            self.devicelist.pack_start(renderer_text, True)
-            self.devicelist.add_attribute(renderer_text, "text", 1)
+    def cancel(self):
+        self.pause()
+        self.button.set_sensitive(False)
+        self.cancel_event.set()
 
-            self.get_devices()
-            # get globally needed widgets
-            self.window = self.wTree.get_object("main_dialog")
-            self.window.connect("destroy", self.close)
+    def pause(self):
+        self.state_event.set()
 
-            # set default file filter to *.iso/*.img
-            filt = Gtk.FileFilter()
-            filt.add_pattern("*.[iI][mM][gG]")
-            filt.add_pattern("*.[iI][sS][oO]")
-            self.chooser.set_filter(filt)
+    def continue_(self):
+        self.state_event.clear()
+           
+    def file_closing(self):
+        if (self.targetDeviceHandler is not None) and  (not self.targetDeviceHandler.closed):
+            self.targetDeviceHandler.close()
+        if (self.sourceFileHandler is not None) and (not self.sourceFileHandler.closed):        
+            self.sourceFileHandler.close()
 
-            # set callbacks
+class milisImageWriter(Gtk.Builder):
+    def __init__(self, iso_path=None):
+        super(milisImageWriter, self).__init__()
+        self.selectedFile = ""
+        self.selectedTarget = ""
+        self.size = 0
+        self.total_size = 0
+        self.written = 0
+        self.write_thread = None
+        self.targetDeviceHandler = None
+        self.sourceFileHandler = None
 
-            dict = {
-                    "on_cancel_button_clicked" : self.close,
-                    "on_emergency_button_clicked" : self.emergency_ok,
-                    "on_success_button_clicked" : self.success_ok,
-                    "on_confirm_cancel_button_clicked" : self.confirm_cancel}
-            self.wTree.connect_signals(dict)
+        self.add_from_file("/usr/share/mintstick/mintstick.ui")
+        self.window = self.get_object("window1")
+        self.window.connect("destroy", self.close)
+        self.window.set_title(_("MİLİS-USB KALIP YAZICI"))
 
-            self.devicelist.connect("changed", self.device_selected)
-            self.go_button.connect("clicked", self.do_write)
-            self.chooser.connect("file-set", self.file_selected)
+        self.content = self.get_object("resultText")
 
-            if iso_path:
-                if os.path.exists(iso_path):
-                    self.chooser.set_filename(iso_path)
-                    self.file_selected(self.chooser)
+        self.devicelist = self.get_object("deviceCombo")
+        self.devicelist.connect("changed", self.selectDevice)
 
-        if mode == "format":
-            self.mode="format"
-            self.devicelist = self.wTree.get_object("formatdevice_combobox")
-            self.label = self.wTree.get_object("formatdevice_label")
-            self.expander = self.wTree.get_object("formatdetail_expander")
-            self.go_button = self.wTree.get_object("format_formatbutton")
-            self.go_button.set_label(_("Format"))
-            self.logview = self.wTree.get_object("format_detail_text")
-            self.label_entry = self.wTree.get_object("volume_label_entry")
-            self.label_entry_changed_id = self.label_entry.connect("changed", self.on_label_entry_text_changed)
+        
+        # signals
+        self.updateBarSignal = barSignal()
+        self.updateBarSignalId = self.updateBarSignal.connect("update", self.updateBar) # to update progress bar
+        self.finishProcessSignal = finishSignal()
+        self.finishProcessId = self.finishProcessSignal.connect("finished", self.on_finished) # on finish img writing process
+        self.cancelProcessSignal = cancelSignal()
+        self.cancelProcessId = self.cancelProcessSignal.connect("cancel", self.on_cancel) # for unknown problems while writing device
+        
+        self.chooser = self.get_object("selectedFile")
+        filt = Gtk.FileFilter()
+        filt.add_pattern("*.[iI][mM][gG]")
+        filt.add_pattern("*.[iI][sS][oO]")
+        self.chooser.set_filter(filt)
+        self.chooser.connect("file-set", self.selectFile)
+        self.udisksCli = UDisks.Client.new_sync()
 
-            self.window = self.wTree.get_object("format_window")
-            self.window.connect("destroy", self.close)
+        # list store
+        self.devicemodel = Gtk.ListStore(str, str, float)
 
-            self.progressbar = self.wTree.get_object("format_progressbar")
-            self.filesystemlist = self.wTree.get_object("filesystem_combobox")
-            # set callbacks
-            dict = {
-                    "on_cancel_button_clicked" : self.close,
-                    "on_emergency_button_clicked" : self.emergency_ok,
-                    "on_success_button_clicked" : self.success_ok,
-                    "on_confirm_cancel_button_clicked" : self.confirm_cancel}
-            self.wTree.connect_signals(dict)
+        # renderer
 
-            self.go_button.connect("clicked", self.do_format)
-            self.filesystemlist.connect("changed", self.filesystem_selected)
-            self.devicelist.connect("changed", self.device_selected)
+        renderer_text = Gtk.CellRendererText()
+        self.devicelist.pack_start(renderer_text, True)
+        self.devicelist.add_attribute(renderer_text, "text", 1)
+        
+        self.playButton = self.get_object("state")
+        self.playButton.set_label(("başla"))        
+        self.playId = self.playButton.connect("clicked", self.control)
+  
+        self.cancelButton = self.get_object("cancel")
+        self.cancelButton.connect("clicked", self.cancel)
+        self.cancelButton.set_sensitive(False)    
 
-            # Filesystemlist
-            self.fsmodel = Gtk.ListStore(str, str, int, bool, bool)
-            #                     id       label    max-length force-upper-case   force-alpha-numeric
-            self.fsmodel.append(["fat32", "FAT32",      11,        True,                True])
-            self.fsmodel.append(["exfat", "exFAT",      15,        False,               False])
-            self.fsmodel.append(["ntfs",  "NTFS",       32,        False,               False])
-            self.fsmodel.append(["ext4",  "EXT4",       16,        False,               False])
-            self.filesystemlist.set_model(self.fsmodel)
+        self.bar = self.get_object("processBar")
+        self.bar.set_show_text(True)
+        
+        self.get_devices()
+        self.udisksCliListener = self.udisksCli.connect("changed", self.get_devices)
 
-            # Renderer
-            renderer_text = Gtk.CellRendererText()
-            self.filesystemlist.pack_start(renderer_text, True)
-            self.filesystemlist.add_attribute(renderer_text, "text", 1)
-
-            # Devicelist model
-            self.devicemodel = Gtk.ListStore(str, str)
-
-            # Renderer
-            renderer_text = Gtk.CellRendererText()
-            self.devicelist.pack_start(renderer_text, True)
-            self.devicelist.add_attribute(renderer_text, "text", 1)
-
-            self.filesystemlist.set_sensitive(True)
-            # Default's to fat32
-            self.filesystemlist.set_active(0)
-            if filesystem is not None:
-                iter = model.get_iter_first()
-                while iter is not None:
-                    value = model.get_value(iter, 0)
-                    if value == filesystem:
-                        self.filesystemlist.set_active_iter(iter)
-                    iter = model.iter_next(iter)
-
-            self.filesystem_selected(self.filesystemlist)
-            self.get_devices()
-
-            if usb_path is not None:
-                iter = self.devicemodel.get_iter_first()
-                while iter is not None:
-                    value = self.devicemodel.get_value(iter, 0)
-                    if usb_path in value:
-                        self.devicelist.set_active_iter(iter)
-                    iter = self.devicemodel.iter_next(iter)
-
+        if iso_path is not None:
+            if os.path.exists(iso_path):
+                self.chooser.set_filename(iso_path)
+                self.selectFile(self.chooser)
         self.window.show_all()
-        if self.mode=="format":
-            self.expander.hide()
-        self.log = self.logview.get_buffer()
 
-    def get_devices(self):
-        self.go_button.set_sensitive(False)
+    def get_devices(self, widget=None):
         self.devicemodel.clear()
         dct = []
         self.dev = None
 
-        manager = self.udisks_client.get_object_manager()
+        manager = self.udisksCli.get_object_manager()
 
         for obj in manager.get_objects():
             if obj is not None:
                 block = obj.get_block()
                 if block is not None:
-                    drive = self.udisks_client.get_drive_for_block(block)
+                    drive = self.udisksCli.get_drive_for_block(block)
                     if drive is not None:
                         is_usb = str(drive.get_property("connection-bus")) == 'usb'
-                        size = int(drive.get_property('size'))
+                        real_size = int(drive.get_property('size'))
                         optical = bool(drive.get_property('optical'))
                         removable = bool(drive.get_property('removable'))
 
-                        if is_usb and size > 0 and removable and not optical:
-                            name = _("unknown")
+                        if is_usb and real_size > 0 and removable and not optical:
+                            name = "unknown"
 
                             block = obj.get_block()
                             if block is not None:
@@ -235,374 +259,205 @@ class MintStick:
                             if driveVendor.strip() != "":
                                 driveModel = "%s %s" % (driveVendor, driveModel)
 
-                            if size >= 1000000000000:
-                                size = "%.0fTB" % round(size / 1000000000000)
-                            elif size >= 1000000000:
-                                size = "%.0fGB" % round(size / 1000000000)
-                            elif size >= 1000000:
-                                size = "%.0fMB" % round(size / 1000000)
-                            elif size >= 1000:
-                                size = "%.0fkB" % round(size / 1000)
+                            if real_size >= 1000000000000:
+                                size = "%.0fTB" % round(real_size / 1000000000000)
+                            elif real_size >= 1000000000:
+                                size = "%.0fGB" % round(real_size / 1000000000)
+                            elif real_size >= 1000000:
+                                size = "%.0fMB" % round(real_size / 1000000)
+                            elif real_size >= 1000:
+                                size = "%.0fkB" % round(real_size / 1000)
                             else:
-                                size = "%.0fB" % round(size)
+                                size = "%.0fB" % round(real_size)
 
                             item = "%s (%s) - %s" % (driveModel, name, size)
 
                             if item not in dct:
                                 dct.append(item)
-                                self.devicemodel.append([name, item])
+                                self.devicemodel.append([str(name), str(item), real_size])
 
         self.devicelist.set_model(self.devicemodel)
 
-    def device_selected(self, widget):
-        iter = self.devicelist.get_active_iter()
-        if iter is not None:
-            self.dev = self.devicemodel.get_value(iter, 0)
-            self.go_button.set_sensitive(True)
+    def selectDevice(self, widget):
+        iter_ = self.devicelist.get_active_iter()
+        if iter_ is not None:
+            self.dev = (self.devicemodel.get_value(iter_, 0), self.devicemodel.get_value(iter_, 2))
+            print("func selectDevice : ", self.dev, "activeThread: ", activeCount())
+            self.selectedTarget = self.dev[0]
 
-    def filesystem_selected(self, widget):
-        iter = self.filesystemlist.get_active_iter()
-        if iter is not None:
-            self.filesystem = self.fsmodel.get_value(iter, 0)
-            self.activate_devicelist()
+    def selectFile(self, widget):
+        self.selectedFile =  self.chooser.get_filename()
 
-            self.label_entry.set_max_length(self.fsmodel.get_value(iter, 2))
-            self.on_label_entry_text_changed(self, self.label_entry)
-
-    def file_selected(self, widget):
-        self.activate_devicelist()
-
-    def on_label_entry_text_changed(self, widget, data=None):
-        self.label_entry.handler_block(self.label_entry_changed_id)
-
-        active_iter = self.filesystemlist.get_active_iter()
-        value = self.fsmodel.get_value(active_iter, 0)
-
-        if self.fsmodel.get_value(active_iter, 3):
-            old_text = self.label_entry.get_text()
-            new_text = old_text.upper()
-            self.label_entry.set_text(new_text)
-
-        if self.fsmodel.get_value(active_iter, 4):
-            old_text = self.label_entry.get_text()
-
-            for char in FORBIDDEN_CHARS:
-                old_text = old_text.replace(char, "")
-
-            new_text = old_text
-            self.label_entry.set_text(new_text)
-
-        length = self.label_entry.get_buffer().get_length()
-        self.label_entry.select_region(length, -1)
-
-        self.label_entry.handler_unblock(self.label_entry_changed_id)
-
-    def do_format(self, widget):
-        if self.debug:
-            print "DEBUG: Format %s as %s" % (self.dev, self.filesystem)
-            return
-
-        self.udisks_client.handler_block(self.udisk_listener_id)
-        self.devicelist.set_sensitive(False)
-        self.filesystemlist.set_sensitive(False)
-        self.go_button.set_sensitive(False)
-
-        label = self.wTree.get_object("volume_label_entry").get_text()
-
-        if os.geteuid() > 0:
-            self.raw_format(self.dev, self.filesystem, label)
-        else:
-            # We are root, display confirmation dialog
-            resp = self.confirm_dialog.run()
-            if resp == Gtk.ResponseType.OK:
-                self.confirm_dialog.hide()
-                self.raw_format(self.dev, self.filesystem, label)
-            else:
-                self.confirm_dialog.hide()
-                self.set_format_sensitive()
-
-    def check_format_job(self):
-        self.process.poll()
-        if self.process.returncode is None:
-            self.pulse_progress()
-            return True
-        else:
-            GObject.idle_add(self.format_job_done, self.process.returncode)
-            self.process = None
-            return False
-
-    def raw_format(self, usb_path, fstype, label):
-        if os.geteuid() > 0:
-            launcher='pkexec'
-            self.process = Popen([launcher,'/usr/bin/python2', '-u', '/usr/lib/mintstick/raw_format.py','-d',usb_path,'-f',fstype, '-l', label, '-u', str(os.geteuid()), '-g', str(os.getgid())], shell=False, stdout=PIPE,  preexec_fn=os.setsid)
-        else:
-            self.process = Popen(['/usr/bin/python2', '-u', '/usr/lib/mintstick/raw_format.py','-d',usb_path,'-f',fstype, '-l', label, '-u', str(os.geteuid()), '-g', str(os.getgid())], shell=False, stdout=PIPE,  preexec_fn=os.setsid)
-
-        self.progressbar.show()
-        self.pulse_progress()
-
-        GObject.timeout_add(500, self.check_format_job)
-
-    def format_job_done(self, rc):
-        self.set_progress(1.0)
-        if rc == 0:
-            message = _('The USB stick was formatted successfully.')
-            self.logger(message)
-            self.success(_('The USB stick was formatted successfully.'))
-            return False
-        elif rc == 5:
-            message = _("An error occured while creating a partition on %s.") % usb_path
-        elif rc == 127:
-            message = _('Authentication Error.')
-        else:
-            message = _('An error occurred.')
-        self.logger(message)
-        self.emergency(message)
-        self.set_format_sensitive()
-        self.udisks_client.handler_unblock(self.udisk_listener_id)
-
-        return False
-
-    def do_write(self, widget):
-        if self.debug:
-            print "DEBUG: Write %s to %s" % (self.chooser.get_filename(), self.dev)
-            return
-
-        self.go_button.set_sensitive(False)
-        self.devicelist.set_sensitive(False)
-        self.chooser.set_sensitive(False)
-        source = self.chooser.get_filename()
-        target = self.dev
-        self.logger(_('Image:') + ' ' + source)
-        self.logger(_('USB stick:')+ ' ' + self.dev)
-
-        if os.geteuid() > 0:
-            self.raw_write(source, target)
-        else:
-            # We are root, display confirmation dialog
-            resp = self.confirm_dialog.run()
-            if resp == Gtk.ResponseType.OK:
-                self.confirm_dialog.hide()
-                self.raw_write(source, target)
-            else:
-                self.confirm_dialog.hide()
-                self.set_iso_sensitive()
-
-    def set_progress(self, size):
-        self.progressbar.set_fraction(size)
-        str_progress = "%3.0f%%" % (float(size)*100)
-        int_progress = int(float(size)*100)
-        self.progressbar.set_text(str_progress)
-        self.window.set_title("%s - %s" % (str_progress, _("USB Image Writer")))
+    def updateBar(self, object, value, size, written):
+        Gdk.threads_enter()
+        # print("---UPDATEBAR----", value, size, written)
+        self.bar.set_fraction(value)
+        int_progress = int(float(value)*100)
         XApp.set_window_progress_pulse(self.window, False)
         XApp.set_window_progress(self.window, int_progress)
+        self.size = size
+        self.written = written
+        Gdk.threads_leave()
 
-    def pulse_progress(self):
-        self.progressbar.pulse()
-        self.window.set_title(_("USB Image Writer"))
-        XApp.set_window_progress_pulse(self.window, True)
+    def control(self, widget):
+        if self.dev is None or not os.path.exists(self.dev[0]):
+            # you must select a device
+            self.show_dialog(_("Bir aygıt seçmelisiniz."))
+            return
+            
+        if not os.path.exists(self.selectedFile):
+            # you must select a disk image file
+            self.show_dialog(_("Bir dosya seçmelisiniz."))
+            return
 
-    def update_progress(self, fd, condition):
-        if Using_Unity:
-            launcher.set_property("progress_visible", True)
-        if condition  is GLib.IO_IN:
-            line = fd.readline()
-            try:
-                size = float(line.strip())
-                progress = round(size * 100)
-                if progress > self.write_progress:
-                    self.write_progress = progress
-                    GObject.idle_add(self.set_progress, size)
-                    if Using_Unity:
-                        launcher.set_property("progress", size)
-            except:
-                pass
-            return True
-        else:
-            GLib.source_remove(self.source_id)
-            return False
+        if float(self.dev[1]) < os.path.getsize(self.selectedFile):
+            # you must get enough space
+            self.show_dialog(_("Yeteri kadar alan yok."))
+            return
 
-    def check_write_job(self):
-        self.process.poll()
-        if self.process.returncode is None:
-            return True
-        else:
-            GObject.idle_add(self.write_job_done, self.process.returncode)
-            self.process = None
-            return False
+        self.file_closing()
+        if activeCount() >= 2:
+            print("[ Thread Danger ]")
 
-    def raw_write(self, source, target):
-        self.progressbar.set_sensitive(True)
-        self.progressbar.set_text(_('Writing %(VAR_FILE)s to %(VAR_DEV)s') % {'VAR_FILE': source.split('/')[-1], 'VAR_DEV': self.dev})
-        self.logger(_('Starting copy from %(VAR_SOURCE)s to %(VAR_TARGET)s') % {'VAR_SOURCE':source, 'VAR_TARGET':target})
 
-        if os.geteuid() > 0:
-            launcher='pkexec'
-            self.process = Popen([launcher,'/usr/bin/python2', '-u', '/usr/lib/mintstick/raw_write.py','-s',source,'-t',target], shell=False, stdout=PIPE, preexec_fn=os.setsid)
-        else:
-            self.process = Popen(['/usr/bin/python2', '-u', '/usr/lib/mintstick/raw_write.py','-s',source,'-t',target], shell=False, stdout=PIPE, preexec_fn=os.setsid)
-
-        self.write_progress = 0
-        self.source_id = GLib.io_add_watch(self.process.stdout, GLib.IO_IN|GLib.IO_HUP, self.update_progress)
-        GObject.timeout_add(500, self.check_write_job)
-
-    def write_job_done(self, rc):
-        if rc == 0:
-            if Using_Unity:
-                launcher.set_property("progress_visible", False)
-                launcher.set_property("urgent", True)
-            message = _('The image was successfully written.')
-            self.set_progress(1.0)
-            self.logger(message)
-            self.success(_('The image was successfully written.'))
-            return False
-        elif rc == 3:
-            message = _('Not enough space on the USB stick.')
-        elif rc == 4:
-            message = _('An error occured while copying the image.')
-        elif rc == 127:
-            message = _('Authentication Error.')
-        else:
-            message = _('An error occurred.')
-        self.logger(message)
-        self.emergency(message)
-        return False
-
-    def success(self,message):
-        label = self.wTree.get_object("label5")
-        label.set_text(message)
-        if self.mode == "normal":
-            self.final_unsensitive()
-        resp = self.success_dialog.run()
-        if resp == Gtk.ResponseType.OK:
-            self.success_dialog.hide()
-
-    def emergency(self, message):
-        if self.mode == "normal":
-            self.final_unsensitive()
-        label = self.wTree.get_object("label6")
-        label.set_text(message)
-        #self.expander.set_expanded(True)
-        mark = self.log.create_mark("end", self.log.get_end_iter(), False)
-        self.logview.scroll_to_mark(mark, 0.05, True, 0.0, 1.0)
-        resp = self.emergency_dialog.run()
-        if resp == Gtk.ResponseType.OK:
-            self.emergency_dialog.hide()
-
-    def final_unsensitive(self):
         self.chooser.set_sensitive(False)
         self.devicelist.set_sensitive(False)
-        self.go_button.set_sensitive(False)
-        self.progressbar.set_sensitive(False)
-        self.window.set_title(_("USB Image Writer"))
+        self.cancelButton.set_sensitive(True)
+        self.udisksCli.handler_block(self.udisksCliListener)
 
-    def close(self, widget):
-        self.write_logfile()
-        if self.process is not None:
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-            except:
-                pass
-            finally:
-                Gtk.main_quit()
+        
+        self.playButton.disconnect(self.playId)
+        self.playId = self.playButton.connect("clicked", self.pause)
+        self.playButton.set_label(_("durdur"))
+
+        self.content.get_buffer().set_text(_("%s , %s 'e yazılıyor..\n"%(self.selectedFile, self.dev[0])))
+
+        self.sourceFileHandler = open(self.selectedFile, "rb")
+        self.targetDeviceHandler = open(self.selectedTarget, "wb")
+        self.total_size = os.path.getsize(self.selectedFile)
+        self.write_thread = writeThread(self.written,
+                                        self.total_size,
+                                        self.size,
+                                        self.targetDeviceHandler, 
+                                        self.sourceFileHandler,
+                                        self.updateBarSignal,
+                                        self.finishProcessSignal,
+                                        self.cancelProcessSignal,
+                                        self.window,
+                                        self.playButton)
+        self.write_thread.start()
+        print("started: ", activeCount())
+
+    def pause(self, obj):
+        self.write_thread.pause()
+        print("waiting", self.write_thread.isAlive(), "activeThread: ", activeCount())
+        self.playButton.disconnect(self.playId)
+        self.playButton.set_label(_("devam et"))
+        self.playId = self.playButton.connect("clicked", self.continue_)
+
+    def continue_(self, obj):
+        print("not waiting", self.write_thread.isAlive(), "activeThread", activeCount())
+        self.playButton.disconnect(self.playId)
+        self.playButton.set_label(_("durdur"))
+        self.playId = self.playButton.connect("clicked", self.pause)
+        self.write_thread.continue_()
+
+    def cancel(self, obj):
+        # self.playButton.set_sensitive(False)
+        self.playButton.disconnect(self.playId)
+        self.write_thread.cancel()
+        time.sleep(0.1)
+        print("[ Is thread live ] = ", self.write_thread.isAlive())
+        self.on_cancel(1, False)
+
+    def on_cancel(self, obj, isUnknownError):
+        if isUnknownError:
+            self.playButton.disconnect(self.playId)
+        self.size = 0
+        self.total_size = 0
+        self.written = 0
+        self.selectedFile = ""
+        self.selectedTarget = ""
+        self.playId = self.playButton.connect("clicked",self.control)
+        self.playButton.set_label(_("başla"))
+        self.devicemodel.clear()
+        self.udisksCli.handler_unblock(self.udisksCliListener)
+        self.get_devices()
+        self.devicelist.set_sensitive(True)
+        self.chooser.unselect_all()
+        self.chooser.set_sensitive(True)
+        self.cancelButton.set_sensitive(False)
+        GLib.idle_add(self.file_closing)
+        text_buffer = self.content.get_buffer()
+        end_iter = text_buffer.get_end_iter()
+        text_buffer.insert(end_iter,_("İptal Edildi"))
+        if isUnknownError:
+            text_buffer.insert(end_iter,_("\nBilinmeyen Bir Hata Meydana Geldi!"))
+
+    def on_finished(self, obj, success_result):
+        self.sourceFileHandler.close()
+        self.targetDeviceHandler.close()
+        if success_result == 1:
+            """mission successful"""
+            text_buffer = self.content.get_buffer()
+            end_iter = text_buffer.get_end_iter()
+            text_buffer.insert(end_iter,_("Kalıp basarıyla yazıldı."))
         else:
+            """mission failed"""
+            text_buffer = self.content.get_buffer()
+            end_iter = text_buffer.get_end_iter()
+            text_buffer.insert(end_iter,_("Kalıp yazma basarısız"))
+        self.playButton.disconnect(self.playId)
+        self.size = 0
+        self.written = 0
+        self.total_size = 0
+        self.cancelButton.set_sensitive(False)
+        self.playButton.set_label(_("başla"))
+        self.playId = self.playButton.connect("clicked", self.control)
+        self.devicelist.set_sensitive(True)
+        self.chooser.set_sensitive(True)
+        self.udisksCli.handler_unblock(self.udisksCliListener)
+        # self.bar.set_fraction(0.0)
+
+    def close(self, object):
+        try:
+            if self.write_thread is not None:
+                self.write_thread.cancel()
+                signal.pthread_kill(self.write_thread.id, signal.SIGTERM)
+            # self.file_closing()
+        except:
+            pass
+        finally:
             Gtk.main_quit()
 
-    def write_logfile(self):
-        start = self.log.get_start_iter()
-        end = self.log.get_end_iter()
-        print self.log.get_text(start, end, False)
+    def file_closing(self):
+        try:
+            if (self.targetDeviceHandler is not None) and  (not self.targetDeviceHandler.closed):
+                self.targetDeviceHandler.close()
+        except OSError:
+            pass
+        if (self.sourceFileHandler is not None) and (not self.sourceFileHandler.closed):        
+            self.sourceFileHandler.close()
 
-    def logger(self, text):
-        self.log.insert_at_cursor(text+"\n")
+    def show_dialog(self, word):
+        dialog = Dialogs(word, self.window)
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK: 
+            dialog.hide()
 
-    def activate_devicelist(self):
-        self.devicelist.set_sensitive(True)
-        self.expander.set_sensitive(True)
-        self.label.set_sensitive(True)
+def main(): 
+    parser = argparse.ArgumentParser(description='milisImageWriter (milisImageWriter) <jarbay910@gmail.com>')
+    parser.add_argument('-i', '--iso_path', dest='iso_path', help='Select the iso', type=str)  
+    args = parser.parse_args()
+    GObject.threads_init()
+    Gdk.threads_init()
+    if args.iso_path is not None:
+        app = milisImageWriter(args.iso_path)
+    else:       
+        app = milisImageWriter()
+    Gtk.main()
+    Gdk.threads_leave()
 
-    def confirm_cancel(self,widget):
-        self.confirm_dialog.hide()
-        if self.mode == "normal": self.set_iso_sensitive()
-        if self.mode == "format": self.set_format_sensitive()
-
-    def emergency_ok(self,widget):
-        self.emergency_dialog.hide()
-        if self.mode == "normal": self.set_iso_sensitive()
-        if self.mode == "format":
-            self.set_format_sensitive()
-            self.go_button.set_sensitive(False)
-
-    def success_ok(self,widget):
-        self.success_dialog.hide()
-        if self.mode == "normal":
-            self.set_iso_sensitive()
-        if self.mode == "format":
-            self.set_format_sensitive()
-            self.go_button.set_sensitive(False)
-
-    def set_iso_sensitive(self):
-        self.chooser.set_sensitive(True)
-        self.devicelist.set_sensitive(True)
-        self.go_button.set_sensitive(True)
-
-    def set_format_sensitive(self):
-        self.get_devices()
-        self.filesystemlist.set_sensitive(True)
-        self.devicelist.set_sensitive(True)
-        self.go_button.set_sensitive(True)
 
 if __name__ == "__main__":
-
-    usb_path=None
-    iso_path=None
-    filesystem=None
-    mode=None
-
-    def usage():
-        print "Usage: mintstick [--debug] -m [format|iso]              : mode (format usb stick or burn iso image)"
-        print "       mintstick [--debug] -m iso [-i|--iso] iso_path"
-        print "       mintstick [--debug] -m format [-u|--usb] usb_device "
-        print "                           [-f|--filesystem] filesystem"
-        exit (0)
-
-    try:
-        opts, args = getopt.getopt(sys.argv[1:], "hm:i:u:f:", ["debug", "help", "mode=", "iso=","usb=","filesystem="])
-    except getopt.error, msg:
-        print msg
-        print "for help use --help"
-        sys.exit(2)
-
-    debug = False
-    for o, a in opts:
-        if o in ("-h", "--help"):
-            usage()
-        elif o in ("-i", "--iso"):
-            iso_path = a
-        elif o in ("-u", "--usb"):
-            # hack. KDE Solid application gives partition name not device name. Need to remove extra digit from the string.
-            # ie. /dev/sdj1 -> /dev/sdj
-            usb_path = ''.join([i for i in a if not i.isdigit()])
-        elif o in ("-f", "--filesystem"):
-            filesystem = a
-        elif o in ("-m", "--mode"):
-            mode=a
-        elif o in ("--debug"):
-            debug = True
-
-    argc = len(sys.argv)
-    if argc > 8:
-        print "Too many arguments"
-        print "for help use --help"
-        exit(2)
-
-    # Mandatory argument
-    if (mode is None) or ((mode != "format") and (mode != "iso")):
-        usage()
-
-    MintStick(iso_path, usb_path, filesystem, mode, debug)
-
-    #start the main loop
-    #mainloop = GObject.MainLoop()
-    #mainloop.run()
-    Gtk.main()
+    main()
